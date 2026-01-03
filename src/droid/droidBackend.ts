@@ -12,7 +12,7 @@ import type {
     SessionId,
     StartSessionResult 
 } from '@/agent/AgentBackend';
-import { DroidClient, DroidClientOptions } from './droidClient';
+import { DroidClient } from './droidClient';
 import type { 
     DroidStreamEvent, 
     DroidAutoLevel,
@@ -23,7 +23,10 @@ import { permissionModeToAutoLevel } from './types';
 import { logger } from '@/ui/logger';
 import { randomUUID } from 'node:crypto';
 
-export interface DroidBackendOptions extends DroidClientOptions {
+export interface DroidBackendOptions {
+    apiKey?: string; // Optional - Droid CLI reads from ~/.factory/auth.json
+    defaultModel?: string;
+    cwd?: string;
     auto?: DroidAutoLevel;
     permissionMode?: DroidPermissionMode;
 }
@@ -37,9 +40,9 @@ export class DroidBackend implements AgentBackend {
     private permissionMode: DroidPermissionMode;
     private isRunning: boolean = false;
 
-    constructor(options: DroidBackendOptions) {
+    constructor(options: DroidBackendOptions = {}) {
         this.client = new DroidClient({
-            apiKey: options.apiKey,
+            apiKey: options.apiKey, // Optional
             defaultModel: options.defaultModel,
             cwd: options.cwd
         });

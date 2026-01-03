@@ -1,19 +1,18 @@
 /**
- * Droid CLI Entry Point
+ * OpenCode CLI Entry Point
  * 
- * This module provides the main entry point for running the Factory Droid agent
+ * This module provides the main entry point for running the OpenCode agent
  * through Happy CLI. It manages the agent lifecycle, session state, and
  * communication with the Happy server and mobile app.
  * 
- * Droid uses a CLI wrapper approach (droid exec) instead of SDK/protocol
- * because droid exec is specifically designed for automation and headless use.
+ * OpenCode uses a server-based approach with HTTP API and SSE events.
  */
 
 import { render } from 'ink';
 import React from 'react';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 import { ApiClient } from '@/api/api';
 import { logger } from '@/ui/logger';
@@ -31,56 +30,70 @@ import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 
-import { DroidBackend } from './droidBackend';
-import { DroidClient } from './droidClient';
-import type { DroidMode, DroidPermissionMode, DroidMessagePayload } from './types';
-import { permissionModeToAutoLevel } from './types';
-import { DEFAULT_DROID_MODEL, DROID_MODEL_ENV, CHANGE_TITLE_INSTRUCTION } from './constants';
-import { readDroidLocalConfig, isDroidAuthenticated, determineDroidModel } from './utils/config';
-import { GeminiDisplay } from '@/ui/ink/GeminiDisplay'; // Reuse Gemini display for now
+import { OpencodeBackend } from './opencodeBackend';
+import { OpencodeClient } from './opencodeClient';
+import type { OpencodeMode, OpencodePermissionMode, OpencodeMessagePayload } from './types';
+import { 
+    DEFAULT_OPENCODE_PORT, 
+    DEFAULT_OPENCODE_MODEL, 
+    OPENCODE_MODEL_ENV,
+    CHANGE_TITLE_INSTRUCTION 
+} from './constants';
+import { 
+    readOpencodeLocalConfig, 
+    isOpencodeAuthenticated, 
+    determineOpencodeModel,
+    getConfiguredProviders 
+} from './utils/config';
+import { GeminiDisplay } from '@/ui/ink/GeminiDisplay';
 import type { AgentMessage } from '@/agent/AgentBackend';
 
 /**
- * Main entry point for the droid command with ink UI
+ * Main entry point for the opencode command with ink UI
  */
-export async function runDroid(opts: {
+export async function runOpencode(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
 }): Promise<void> {
     //
-    // Verify Droid CLI is available
+    // Verify OpenCode CLI is available
     //
 
-    const isAvailable = await DroidClient.isAvailable();
+    const isAvailable = await OpencodeClient.isAvailable();
     if (!isAvailable) {
-        console.error('Error: Droid CLI not found.');
+        console.error('Error: OpenCode CLI not found.');
         console.error('Please install it first:');
-        console.error('  curl -fsSL https://app.factory.ai/cli | sh');
+        console.error('  curl -fsSL https://opencode.ai/install | bash');
         console.error('');
         console.error('Or via npm:');
-        console.error('  npm install -g @factory/cli');
+        console.error('  npm install -g opencode');
         process.exit(1);
     }
 
     //
-    // Verify authentication - Droid CLI uses ~/.factory/auth.json (like Gemini uses ~/.gemini/)
+    // Verify authentication - OpenCode uses ~/.local/share/opencode/auth.json
     //
 
-    const droidConfig = readDroidLocalConfig();
-    if (!isDroidAuthenticated()) {
-        console.error('Error: Droid CLI not authenticated.');
+    const opencodeConfig = readOpencodeLocalConfig();
+    if (!isOpencodeAuthenticated()) {
+        console.error('Error: OpenCode not authenticated.');
         console.error('');
-        console.error('Please login first by running:');
-        console.error('  droid');
+        console.error('Please configure a provider first by running:');
+        console.error('  opencode auth login');
         console.error('');
-        console.error('This will open a browser to authenticate with Factory.');
-        console.error('Your credentials will be saved to ~/.factory/auth.json');
+        console.error('Or set provider API keys as environment variables:');
+        console.error('  export ANTHROPIC_API_KEY="your-key"');
+        console.error('  export OPENAI_API_KEY="your-key"');
         process.exit(1);
     }
 
-    // Determine model to use (env var > local config > default)
-    const initialModel = determineDroidModel(undefined, droidConfig);
-    logger.debug(`[Droid] Using model: ${initialModel}`);
+    // Log configured providers
+    const providers = getConfiguredProviders();
+    logger.debug(`[OpenCode] Authenticated with providers: ${providers.join(', ')}`);
+
+    // Determine model to use
+    const initialModel = determineOpencodeModel(undefined, opencodeConfig);
+    logger.debug(`[OpenCode] Using model: ${initialModel}`);
 
     //
     // Define session
@@ -127,7 +140,7 @@ export async function runDroid(opts: {
         startedBy: opts.startedBy || 'terminal',
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
-        flavor: 'droid'
+        flavor: 'opencode'
     };
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     const session = api.sessionSyncClient(response);
@@ -149,25 +162,25 @@ export async function runDroid(opts: {
     // Message queue for handling incoming messages
     //
 
-    const messageQueue = new MessageQueue2<DroidMode>((mode) => hashObject({
+    const messageQueue = new MessageQueue2<OpencodeMode>((mode) => hashObject({
         permissionMode: mode.permissionMode,
         model: mode.model,
     }));
 
-    // Track current overrides
-    let currentPermissionMode: DroidPermissionMode = 'default';
-    let currentModel: string | undefined = process.env[DROID_MODEL_ENV] || undefined;
+    // Track current overrides (using initialModel from config)
+    let currentPermissionMode: OpencodePermissionMode = 'default';
+    let currentModel: string | undefined = initialModel;
 
     session.onUserMessage((message) => {
         // Resolve permission mode
         let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
-            const validModes: DroidPermissionMode[] = ['default', 'read-only', 'safe-yolo', 'yolo'];
-            if (validModes.includes(message.meta.permissionMode as DroidPermissionMode)) {
-                messagePermissionMode = message.meta.permissionMode as DroidPermissionMode;
+            const validModes: OpencodePermissionMode[] = ['default', 'read-only', 'safe-yolo', 'yolo'];
+            if (validModes.includes(message.meta.permissionMode as OpencodePermissionMode)) {
+                messagePermissionMode = message.meta.permissionMode as OpencodePermissionMode;
                 currentPermissionMode = messagePermissionMode;
-                droidBackend.setPermissionMode(messagePermissionMode);
-                logger.debug(`[Droid] Permission mode updated to: ${currentPermissionMode}`);
+                opencodeBackend.setPermissionMode(messagePermissionMode);
+                logger.debug(`[OpenCode] Permission mode updated to: ${currentPermissionMode}`);
             }
         }
 
@@ -180,7 +193,7 @@ export async function runDroid(opts: {
             } else if (message.meta.model) {
                 messageModel = message.meta.model;
                 currentModel = messageModel;
-                droidBackend.setModel(messageModel);
+                opencodeBackend.setModel(messageModel);
                 messageBuffer.addMessage(`Model changed to: ${messageModel}`, 'system');
             }
         }
@@ -188,14 +201,14 @@ export async function runDroid(opts: {
         // Build the full prompt
         const originalUserMessage = message.content.text;
         let fullPrompt = originalUserMessage;
-        
+
         // Add title instruction for first message
         if (isFirstMessage && message.meta?.appendSystemPrompt) {
             fullPrompt = message.meta.appendSystemPrompt + '\n\n' + originalUserMessage + '\n\n' + CHANGE_TITLE_INSTRUCTION;
             isFirstMessage = false;
         }
 
-        const mode: DroidMode = {
+        const mode: OpencodeMode = {
             permissionMode: messagePermissionMode,
             model: messageModel,
             originalUserMessage,
@@ -216,11 +229,11 @@ export async function runDroid(opts: {
         try {
             api.push().sendToAllDevices(
                 "It's ready!",
-                'Droid is waiting for your command',
+                'OpenCode is waiting for your command',
                 { sessionId: session.sessionId }
             );
         } catch (pushError) {
-            logger.debug('[Droid] Failed to send ready push', pushError);
+            logger.debug('[OpenCode] Failed to send ready push', pushError);
         }
     };
 
@@ -242,24 +255,24 @@ export async function runDroid(opts: {
     let accumulatedResponse = '';
 
     async function handleAbort() {
-        logger.debug('[Droid] Abort requested');
-        
+        logger.debug('[OpenCode] Abort requested');
+
         session.sendCodexMessage({
             type: 'turn_aborted',
             id: randomUUID(),
         });
-        
+
         try {
             messageQueue.reset();
-            await droidBackend.cancel(response.id);
-            logger.debug('[Droid] Abort completed');
+            await opencodeBackend.cancel(response.id);
+            logger.debug('[OpenCode] Abort completed');
         } catch (error) {
-            logger.debug('[Droid] Error during abort:', error);
+            logger.debug('[OpenCode] Error during abort:', error);
         }
     }
 
     const handleKillSession = async () => {
-        logger.debug('[Droid] Kill session requested');
+        logger.debug('[OpenCode] Kill session requested');
         await handleAbort();
 
         try {
@@ -280,12 +293,12 @@ export async function runDroid(opts: {
             clearInterval(keepAliveInterval);
             stopCaffeinate();
             happyServer.stop();
-            await droidBackend.dispose();
+            await opencodeBackend.dispose();
 
-            logger.debug('[Droid] Session termination complete');
+            logger.debug('[OpenCode] Session termination complete');
             process.exit(0);
         } catch (error) {
-            logger.debug('[Droid] Error during session termination:', error);
+            logger.debug('[OpenCode] Error during session termination:', error);
             process.exit(1);
         }
     };
@@ -301,7 +314,7 @@ export async function runDroid(opts: {
     const hasTTY = process.stdout.isTTY && process.stdin.isTTY;
     let inkInstance: ReturnType<typeof render> | null = null;
 
-    let displayedModel: string | undefined = currentModel || DEFAULT_DROID_MODEL;
+    let displayedModel: string | undefined = currentModel || DEFAULT_OPENCODE_MODEL;
 
     if (hasTTY) {
         console.clear();
@@ -309,21 +322,21 @@ export async function runDroid(opts: {
             return React.createElement(GeminiDisplay, {
                 messageBuffer,
                 logPath: process.env.DEBUG ? logger.getLogPath() : undefined,
-                currentModel: displayedModel || DEFAULT_DROID_MODEL,
-                agentName: 'Droid',
+                currentModel: displayedModel || DEFAULT_OPENCODE_MODEL,
+                agentName: 'OpenCode',
                 onExit: async () => {
-                    logger.debug('[Droid]: Exiting via Ctrl-C');
+                    logger.debug('[OpenCode]: Exiting via Ctrl-C');
                     shouldExit = true;
                     await handleAbort();
                 }
             });
         };
-        
+
         inkInstance = render(React.createElement(DisplayComponent), {
             exitOnCtrlC: false,
             patchConsole: false
         });
-        
+
         messageBuffer.addMessage(`[MODEL:${displayedModel}]`, 'system');
     }
 
@@ -336,20 +349,21 @@ export async function runDroid(opts: {
     }
 
     //
-    // Start Happy MCP server and create Droid backend
+    // Start Happy MCP server and create OpenCode backend
     //
 
     const happyServer = await startHappyServer(session);
-    
-    // Create Droid backend (uses ~/.factory/auth.json for authentication)
-    const droidBackend = new DroidBackend({
-        defaultModel: currentModel || DEFAULT_DROID_MODEL,
-        cwd: process.cwd(),
+
+    // Create OpenCode backend - start its own server
+    const opencodeBackend = new OpencodeBackend({
+        model: currentModel || DEFAULT_OPENCODE_MODEL,
+        port: DEFAULT_OPENCODE_PORT + 1, // Avoid conflict with default
+        startServer: true,
         permissionMode: currentPermissionMode
     });
 
     // Set up message handler
-    droidBackend.onMessage((msg: AgentMessage) => {
+    opencodeBackend.onMessage((msg: AgentMessage) => {
         switch (msg.type) {
             case 'model-output':
                 if (msg.textDelta || msg.fullText) {
@@ -366,8 +380,8 @@ export async function runDroid(opts: {
                 break;
 
             case 'status':
-                logger.debug(`[Droid] Status: ${msg.status}${msg.detail ? ` - ${msg.detail}` : ''}`);
-                
+                logger.debug(`[OpenCode] Status: ${msg.status}${msg.detail ? ` - ${msg.detail}` : ''}`);
+
                 if (msg.status === 'running') {
                     thinking = true;
                     session.keepAlive(thinking, 'remote');
@@ -376,9 +390,9 @@ export async function runDroid(opts: {
                 } else if (msg.status === 'idle' || msg.status === 'stopped') {
                     thinking = false;
                     session.keepAlive(thinking, 'remote');
-                    
+
                     if (isResponseInProgress && accumulatedResponse.trim()) {
-                        const messagePayload: DroidMessagePayload = {
+                        const messagePayload: OpencodeMessagePayload = {
                             type: 'message',
                             message: accumulatedResponse,
                             id: randomUUID(),
@@ -392,7 +406,7 @@ export async function runDroid(opts: {
                     thinking = false;
                     session.keepAlive(thinking, 'remote');
                     session.sendCodexMessage({ type: 'turn_aborted', id: randomUUID() });
-                    
+
                     const errorMessage = msg.detail || 'Unknown error';
                     messageBuffer.addMessage(`Error: ${errorMessage}`, 'status');
                     session.sendCodexMessage({
@@ -400,28 +414,45 @@ export async function runDroid(opts: {
                         message: `Error: ${errorMessage}`,
                         id: randomUUID(),
                     });
-                    
+
                     accumulatedResponse = '';
                     isResponseInProgress = false;
                 }
                 break;
 
             case 'tool-call':
-                logger.debug(`[Droid] Tool call: ${msg.toolName}`);
+                logger.debug(`[OpenCode] Tool call: ${msg.toolName}`);
                 messageBuffer.addMessage(`Using tool: ${msg.toolName}`, 'system');
                 break;
 
             case 'tool-result':
-                logger.debug(`[Droid] Tool result: ${msg.toolName}`);
+                logger.debug(`[OpenCode] Tool result: ${msg.toolName}`);
                 break;
 
             case 'fs-edit':
-                logger.debug(`[Droid] File edit: ${msg.description}`);
+                logger.debug(`[OpenCode] File edit: ${msg.description}`);
                 messageBuffer.addMessage(`📝 ${msg.description}`, 'system');
                 break;
 
             case 'terminal-output':
-                logger.debug(`[Droid] Terminal output`);
+                logger.debug(`[OpenCode] Terminal output`);
+                break;
+
+            case 'permission-request':
+                logger.debug(`[OpenCode] Permission request: ${msg.reason}`);
+                // Auto-approve based on permission mode
+                if (currentPermissionMode === 'yolo' || currentPermissionMode === 'safe-yolo') {
+                    opencodeBackend.respondToPermission(msg.id, true);
+                } else {
+                    messageBuffer.addMessage(`⚠️ Permission requested: ${msg.reason}`, 'system');
+                    // Forward to mobile app
+                    session.sendCodexMessage({
+                        type: 'permission-request' as any,
+                        id: msg.id,
+                        reason: msg.reason,
+                        payload: msg.payload
+                    });
+                }
                 break;
         }
     });
@@ -430,8 +461,8 @@ export async function runDroid(opts: {
     // Main message processing loop
     //
 
-    logger.debug('[Droid] Starting message processing loop');
-    
+    logger.debug('[OpenCode] Starting message processing loop');
+
     // Initial ready signal
     emitReadyIfIdle();
 
@@ -443,17 +474,17 @@ export async function runDroid(opts: {
         }
 
         const { message: prompt, mode } = item;
-        logger.debug(`[Droid] Processing prompt (${prompt.length} chars), mode:`, mode.permissionMode);
+        logger.debug(`[OpenCode] Processing prompt (${prompt.length} chars), mode:`, mode.permissionMode);
 
         // Reset accumulator for new prompt
         accumulatedResponse = '';
         isResponseInProgress = false;
 
         try {
-            // Send prompt to Droid
-            await droidBackend.sendPrompt(response.id, prompt);
+            // Send prompt to OpenCode
+            await opencodeBackend.sendPrompt(response.id, prompt);
         } catch (error) {
-            logger.debug('[Droid] Error sending prompt:', error);
+            logger.debug('[OpenCode] Error sending prompt:', error);
             messageBuffer.addMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`, 'status');
         } finally {
             emitReadyIfIdle();
@@ -465,12 +496,12 @@ export async function runDroid(opts: {
     //
 
     clearInterval(keepAliveInterval);
-    
+
     if (inkInstance) {
         inkInstance.unmount();
     }
 
-    await droidBackend.dispose();
+    await opencodeBackend.dispose();
     happyServer.stop();
     stopCaffeinate();
 }

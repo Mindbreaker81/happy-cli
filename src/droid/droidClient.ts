@@ -20,20 +20,20 @@ import { logger } from '@/ui/logger';
 import { FACTORY_API_KEY_ENV, DEFAULT_DROID_MODEL } from './constants';
 
 export interface DroidClientOptions {
-    apiKey: string;
+    apiKey?: string; // Optional - Droid CLI reads from ~/.factory/auth.json
     defaultModel?: string;
     cwd?: string;
 }
 
 export class DroidClient extends EventEmitter {
-    private apiKey: string;
+    private apiKey: string | undefined;
     private defaultModel: string;
     private defaultCwd: string;
     private currentProcess: ChildProcess | null = null;
 
-    constructor(options: DroidClientOptions) {
+    constructor(options: DroidClientOptions = {}) {
         super();
-        this.apiKey = options.apiKey;
+        this.apiKey = options.apiKey; // Optional - CLI uses ~/.factory/auth.json if not set
         this.defaultModel = options.defaultModel || DEFAULT_DROID_MODEL;
         this.defaultCwd = options.cwd || process.cwd();
     }
@@ -47,8 +47,13 @@ export class DroidClient extends EventEmitter {
         logger.debug('[droid] Executing:', 'droid', args.join(' '));
 
         return new Promise((resolve, reject) => {
+            // Only set API key env var if explicitly provided (CLI uses ~/.factory/auth.json otherwise)
+            const env = this.apiKey 
+                ? { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey }
+                : { ...process.env };
+            
             const droid = spawn('droid', args, {
-                env: { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey },
+                env,
                 cwd: options.cwd || this.defaultCwd
             });
 
@@ -105,8 +110,13 @@ export class DroidClient extends EventEmitter {
         logger.debug('[droid] Streaming:', 'droid', args.join(' '));
 
         return new Promise((resolve, reject) => {
+            // Only set API key env var if explicitly provided (CLI uses ~/.factory/auth.json otherwise)
+            const env = this.apiKey 
+                ? { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey }
+                : { ...process.env };
+            
             const droid = spawn('droid', args, {
-                env: { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey },
+                env,
                 cwd: options.cwd || this.defaultCwd
             });
 
@@ -286,8 +296,13 @@ export class DroidClient extends EventEmitter {
      */
     async getAvailableTools(): Promise<string[]> {
         return new Promise((resolve) => {
+            // Only set API key env var if explicitly provided
+            const env = this.apiKey 
+                ? { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey }
+                : { ...process.env };
+            
             const droid = spawn('droid', ['exec', '--list-tools'], {
-                env: { ...process.env, [FACTORY_API_KEY_ENV]: this.apiKey },
+                env,
                 stdio: ['ignore', 'pipe', 'pipe']
             });
 
